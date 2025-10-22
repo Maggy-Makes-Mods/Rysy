@@ -293,7 +293,10 @@ public sealed partial class Settings : IHasJsonCtx<Settings> {
     public bool NotificationWindowOpen { get; set; } = false;
 
     public int GridSize { get; set; } = 8;
-
+    
+    public bool EnableMusicInEditor { get; set; } = false;
+    
+    public float EditorMusicVolume { get; set; } = 0.5f;
     #endregion
 
     public static JsonTypeInfo<Settings> JsonCtx => DefaultJsonContext.Default.Settings;

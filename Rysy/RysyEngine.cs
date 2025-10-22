@@ -7,6 +7,12 @@ using Rysy.Mods;
 using Rysy.Platforms;
 using Rysy.Scenes;
 using Rysy.Selections;
+using Rysy.Audio;
+using Rysy.Compatibility;
+using Rysy.Synchronization;
+using Rysy.BossRegistry;
+using Rysy.Graphics.Models;
+using ImGuiNET;
 
 namespace Rysy;
 
@@ -169,6 +175,14 @@ public sealed class RysyEngine : Game {
         if (RysyPlatform.Current.SupportImGui && !RysyState.ImGuiAvailable)
             ImGuiManager.Load();
 
+        // Initialize new components
+        AhornCompatibility.Initialize();
+        MapleCompatibility.Initialize();
+        EditorAudioManager.Initialize();
+        GameEditorSync.Initialize();
+        BossRegistry.BossRegistry.Initialize();
+        Model3DManager.Initialize(GraphicsDevice);
+
         var celesteDir = Profile.Instance.CelesteDirectory;
         if (!string.IsNullOrWhiteSpace(celesteDir) && !Path.Exists(celesteDir)) {
             Profile.Instance.CelesteDirectory = "";
@@ -215,5 +229,14 @@ public sealed class RysyEngine : Game {
         if (true) {
             RysyState.DispatchRender((float) gameTime.ElapsedGameTime.TotalSeconds);
         }
+    }
+    
+    protected override void OnExiting(object sender, EventArgs args) {
+        // Cleanup components
+        EditorAudioManager.Dispose();
+        GameEditorSync.Dispose();
+        Model3DManager.Dispose();
+        
+        base.OnExiting(sender, args);
     }
 }

@@ -198,6 +198,29 @@ public static class Menubar {
                 settings.Save();
             }
         }
+        
+        // Editor music controls
+        if (settings is { } && ImGui.BeginMenu("Editor Music")) {
+            var enableMusic = settings.EnableMusicInEditor;
+            if (ImGui.Checkbox("Enable Music in Editor", ref enableMusic)) {
+                settings.EnableMusicInEditor = enableMusic;
+                settings.Save();
+                if (!enableMusic) {
+                    Rysy.Audio.EditorAudioManager.StopMusic();
+                }
+            }
+            
+            if (enableMusic) {
+                var volume = settings.EditorMusicVolume;
+                if (ImGui.SliderFloat("Music Volume", ref volume, 0f, 1f)) {
+                    settings.EditorMusicVolume = volume;
+                    settings.Save();
+                    Rysy.Audio.EditorAudioManager.UpdateVolume();
+                }
+            }
+            
+            ImGui.EndMenu();
+        }
     }
 
     private static void ViewVisibilityMenu() {
@@ -260,6 +283,10 @@ public static class Menubar {
 
         if (ImGui.Button(MapAnalyzerWindow.Name)) {
             RysyEngine.Scene.ToggleWindow<MapAnalyzerWindow>();
+        }
+        
+        if (ImGui.Button("Boss List")) {
+            RysyEngine.Scene.ToggleWindow<BossListWindow>();
         }
         
         if (ImGuiManager.TranslatedButton(NotificationsWindow.TitleId)) {

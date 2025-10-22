@@ -15,8 +15,16 @@ using Rysy.Tools;
 
 namespace Rysy.Scenes;
 
-public sealed class EditorScene : Scene {
-    public ToolHandler ToolHandler;
+public sealed class EditorScene : Scene, IDisposable {
+    private ToolHandler? _toolHandler;
+    private readonly object _disposalLock = new();
+    private volatile bool _disposed = false;
+    private CancellationTokenSource? _loadingCancellationTokenSource;
+
+    public ToolHandler? ToolHandler {
+        get => _toolHandler;
+        private set => _toolHandler = value;
+    }
 
     public HistoryHandler HistoryHandler {
         get => EditorState.History ??= new HistoryHandler(Map);
@@ -25,15 +33,25 @@ public sealed class EditorScene : Scene {
 
     public Map? Map {
         get => EditorState.Map;
-        set => EditorState.Map = value;
+        set {
+            if (EditorState.Map != value) {
+                EditorState.Map = value;
+                OnMapChanged();
+            }
+        }
     }
 
     private void OnMapChanged() {
+        if (_disposed) return;
+
         var map = EditorState.Map;
 
         SwapMapPreserveState(map);
 
-        Camera ??= new();
+        // Ensure Camera is always initialized
+        if (EditorState.Camera == null) {
+            EditorState.Camera = new Camera();
+        }
 
         if (map?.Rooms.Count > 0) {
             CurrentRoom = map.Rooms.First();
@@ -41,7 +59,7 @@ public sealed class EditorScene : Scene {
         }
 
         if (map is { })
-            Persistence.Instance.PushRecentMap(map);
+            Persistence.Instance?.PushRecentMap(map);
 
         RysyState.OnEndOfThisFrame += GCHelper.VeryAggressiveGC;
     }
@@ -50,9 +68,10 @@ public sealed class EditorScene : Scene {
         EditorState.Map = map;
 
         // history has to be cleared, as it might contain references to specific entity instances
-        HistoryHandler.Clear();
+        HistoryHandler?.Clear();
 
-        HistoryHandler.Map = map;
+        if (HistoryHandler != null)
+            HistoryHandler.Map = map;
     }
 
     public Room? CurrentRoom {
@@ -61,16 +80,17 @@ public sealed class EditorScene : Scene {
     }
 
     public Camera Camera {
-        get => EditorState.Camera!;
+        get => EditorState.Camera ??= new Camera();
         set => EditorState.Camera = value;
-    } // will be set in Map.set
+    }
 
     public EditorScene() {
-        //HistoryHandler = new();
+        // Ensure Camera is initialized early
+        if (EditorState.Camera == null) {
+            EditorState.Camera = new Camera();
+        }
 
-        //EditorState.OnMapChanged += OnMapChanged;
-
-        if (Settings.Instance.NotificationWindowOpen)
+        if (Settings.Instance?.NotificationWindowOpen == true)
             AddWindowIfNeeded<NotificationsWindow>();
     }
 
@@ -83,7 +103,9 @@ public sealed class EditorScene : Scene {
     }
 
     public Task LoadFromPersistence() {
-        if (RysyState.CmdArguments.LoadIntoMap is { } path) {
+        if (_disposed) return Task.CompletedTask;
+
+        if (RysyState.CmdArguments?.LoadIntoMap is { } path) {
             RysyState.CmdArguments.LoadIntoMap = null;
             return LoadMapFromBinCore(path);
         }
@@ -96,28 +118,22 @@ public sealed class EditorScene : Scene {
     }
 
     public override void SetupHotkeys() {
+        if (_disposed) return;
+
         base.SetupHotkeys();
 
-        Hotkeys.AddHotkeyFromSettings("openMap", "ctrl+o", Open);
-        Hotkeys.AddHotkeyFromSettings("newMap", "ctrl+shift+n", () => LoadNewMap());
+        Hotkeys?.AddHotkeyFromSettings("openMap", "ctrl+o", Open);
+        Hotkeys?.AddHotkeyFromSettings("newMap", "ctrl+shift+n", () => LoadNewMap());
 
-        HotkeysIgnoreImGui.AddHistoryHotkeys(Undo, Redo, () => Save());
+        HotkeysIgnoreImGui?.AddHistoryHotkeys(Undo, Redo, () => Save());
 
-        Hotkeys.AddHotkeyFromSettings("newRoom", "ctrl+n", AddNewRoom);
+        Hotkeys?.AddHotkeyFromSettings("newRoom", "ctrl+n", AddNewRoom);
 
-        // The Room Selection mode can do this much better already, no reason to waste binds on this
-        //Hotkeys.AddHotkeyFromSettings("moveRoomDown", "alt+down", () => MoveCurrentRoom(0, 1), HotkeyModes.OnHoldSmoothInterval);
-        //Hotkeys.AddHotkeyFromSettings("moveRoomUp", "alt+up", () => MoveCurrentRoom(0, -1), HotkeyModes.OnHoldSmoothInterval);
-        //Hotkeys.AddHotkeyFromSettings("moveRoomLeft", "alt+left", () => MoveCurrentRoom(-1, 0), HotkeyModes.OnHoldSmoothInterval);
-        //Hotkeys.AddHotkeyFromSettings("moveRoomRight", "alt+right", () => MoveCurrentRoom(1, 0), HotkeyModes.OnHoldSmoothInterval);
+        ToolHandler?.InitHotkeys(Hotkeys);
+        Camera?.CreateCameraHotkeys(Hotkeys);
 
-        //Hotkeys.AddHotkeyFromSettings("layerUp", "pageup", () => ChangeEditorLayer(1), HotkeyModes.OnHoldSmoothInterval);
-        //Hotkeys.AddHotkeyFromSettings("layerDown", "pagedown", () => ChangeEditorLayer(-1), HotkeyModes.OnHoldSmoothInterval);
-
-        ToolHandler.InitHotkeys(Hotkeys);
-        Camera.CreateCameraHotkeys(Hotkeys);
-
-        _ = new QuickActionHandler(Hotkeys, ToolHandler);
+        if (Hotkeys != null && ToolHandler != null)
+            _ = new QuickActionHandler(Hotkeys, ToolHandler);
     }
 
     public void ClearMapRenderCache() {
@@ -128,13 +144,12 @@ public sealed class EditorScene : Scene {
         if (Map is null)
             return;
         
-        //var index = Map.IndexOfEditorGroup(Persistence.Instance.EditorGroup ?? EditorGroup.Default.Name);
-        //todo: implement editor group hotkeys
-
         ClearMapRenderCache();
     }
 
     protected internal override void OnFileDrop(string filePath) {
+        if (_disposed) return;
+
         base.OnFileDrop(filePath);
 
         if (File.Exists(filePath) && Path.GetExtension(filePath) == ".bin") {
@@ -143,36 +158,54 @@ public sealed class EditorScene : Scene {
     }
 
     internal void LoadMapFromBin(string file, bool fromPersistence = false, bool fromBackup = false, string? overrideFilepath = null) {
-        if (!File.Exists(file)) {
+        if (_disposed || !File.Exists(file)) {
             return;
         }
+
+        // Cancel any previous loading operation
+        _loadingCancellationTokenSource?.Cancel();
+        _loadingCancellationTokenSource?.Dispose();
+        _loadingCancellationTokenSource = new CancellationTokenSource();
+        
+        var token = _loadingCancellationTokenSource.Token;
         
         RysyState.OnEndOfThisFrame += () => Task.Run(async () => {
-            if (RysyEngine.Scene is not LoadingScene) {
-                var oldScene = RysyEngine.Scene;
+            try {
+                if (token.IsCancellationRequested) return;
+
+                if (RysyEngine.Scene is not LoadingScene) {
+                    var oldScene = RysyEngine.Scene;
+                    
+                    RysyEngine.Scene = new LoadingScene(new([
+                        new SimpleLoadTask($"Loading map {file.Censor()}", async (t) => {
+                            await LoadMapFromBinCore(file, fromPersistence, fromBackup, overrideFilepath);
+                            return LoadTaskResult.Success();
+                        })
+                    ]), onCompleted: () => {
+                        if (!token.IsCancellationRequested)
+                            RysyEngine.Scene = oldScene;
+                    });
+                    
+                    return;
+                }
                 
-                RysyEngine.Scene = new LoadingScene(new([
-                    new SimpleLoadTask($"Loading map {file.Censor()}", async (t) => {
-                        await LoadMapFromBinCore(file, fromPersistence, fromBackup, overrideFilepath);
-                        return LoadTaskResult.Success();
-                    })
-                ]), onCompleted: () => {
-                    RysyEngine.Scene = oldScene;
-                });
-                
-                return;
+                await LoadMapFromBinCore(file, fromPersistence, fromBackup, overrideFilepath);
+            } catch (OperationCanceledException) {
+                // Expected when cancellation is requested
+            } catch (Exception ex) {
+                Logger.Write("LoadMapFromBin", LogLevel.Error, $"Unexpected error in loading task: {ex}");
             }
-            
-            await LoadMapFromBinCore(file, fromPersistence, fromBackup, overrideFilepath);
-        });
+        }, token);
     }
 
-    internal async Task LoadMapFromBinCore(string file, bool fromPersistence = false, bool fromBackup = false, string? overrideFilepath = null) {
+    internal async Task LoadMapFromBinCore(string file, bool fromPersistence = false, bool fromBackup = false, string? overrideFilepath = null, CancellationToken cancellationToken = default) {
+        if (_disposed) return;
+
         try {
             // Just to make this run async, so we can see the loading screen.
-            await Task.Delay(1);
+            await Task.Delay(1, cancellationToken);
 
-            //throw new Exception();
+            if (cancellationToken.IsCancellationRequested) return;
 
             var mapBin = BinaryPacker.FromBinary(file);
 
@@ -181,25 +214,33 @@ public sealed class EditorScene : Scene {
                 map.Filepath = overrideFilepath;
             }
             
-            Map = map;
+            if (!cancellationToken.IsCancellationRequested && !_disposed) {
+                Map = map;
+            }
+        } catch (OperationCanceledException) {
+            // Expected when cancellation is requested
         } catch (Exception e) {
-            Logger.Write("LoadMapFromBin", LogLevel.Error, $"Failed to load map: {e}");
+            if (!_disposed) {
+                Logger.Write("LoadMapFromBin", LogLevel.Error, $"Failed to load map: {e}");
 
-            if (fromPersistence) {
-                AddWindow(new PersistenceMapLoadErrorWindow(e, "fromPersistence"));
-            } else if (fromBackup) {
-                AddWindow(new PersistenceMapLoadErrorWindow(e, "fromBackup"));
-            } else {
-                AddWindow(new CrashWindow("rysy.mapLoadError.other".TranslateFormatted(file.Censor()), e, (w) => {
-                    if (ImGui.Button("rysy.ok".Translate())) {
-                        w.RemoveSelf();
-                    }
-                }));
+                if (fromPersistence) {
+                    AddWindow(new PersistenceMapLoadErrorWindow(e, "fromPersistence"));
+                } else if (fromBackup) {
+                    AddWindow(new PersistenceMapLoadErrorWindow(e, "fromBackup"));
+                } else {
+                    AddWindow(new CrashWindow("rysy.mapLoadError.other".TranslateFormatted(file.Censor()), e, (w) => {
+                        if (ImGui.Button("rysy.ok".Translate())) {
+                            w.RemoveSelf();
+                        }
+                    }));
+                }
             }
         }
     }
 
     public void LoadNewMap(string? packageName = null) {
+        if (_disposed) return;
+
         if (packageName is null) {
             AddNewMapWindow();
             return;
@@ -209,6 +250,8 @@ public sealed class EditorScene : Scene {
     }
 
     private void AddNewMapWindow() {
+        if (_disposed) return;
+
         var wData = "";
         var window = new ScriptedWindow("New map", (w) => {
             ImGui.TextWrapped("Please enter the Package Name for your map.");
@@ -229,7 +272,7 @@ public sealed class EditorScene : Scene {
     }
 
     public void Save(bool saveAs = false) {
-        if (Map is not { })
+        if (_disposed || Map is not { })
             return;
 
         if (saveAs || string.IsNullOrWhiteSpace(Map.Filepath) || !File.Exists(Map.Filepath)) {
@@ -238,7 +281,7 @@ public sealed class EditorScene : Scene {
             }
 
             Map.Filepath = filepath;
-            Persistence.Instance.PushRecentMap(Map);
+            Persistence.Instance?.PushRecentMap(Map);
         }
 
         BackupHandler.Backup(Map);
@@ -253,8 +296,10 @@ public sealed class EditorScene : Scene {
     }
 
     private void ForceSave() {
+        if (_disposed || Map is null) return;
+
         using var watch = new ScopedStopwatch("Saving");
-        var pack = Map!.IntoBinary();
+        var pack = Map.IntoBinary();
         BinaryPacker.SaveToFile(pack, pack.Filename!);
         ModRegistry.NotifyFileCreatedAtRealPath(pack.Filename);
         Map.Filepath = pack.Filename;
@@ -263,13 +308,15 @@ public sealed class EditorScene : Scene {
     }
 
     public void Open() {
+        if (_disposed) return;
+
         if (FileDialogHelper.TryOpen("bin", out var path)) {
             LoadMapFromBin(path);
         }
     }
 
     public void AddNewRoom() {
-        if (Map is not { })
+        if (_disposed || Map is not { })
             return;
 
         var current = CurrentRoom;
@@ -290,16 +337,24 @@ public sealed class EditorScene : Scene {
     }
 
     public void MoveCurrentRoom(int tilesX, int tilesY) {
-        if (CurrentRoom is { } room)
-            HistoryHandler.ApplyNewAction(new RoomMoveAction(room, tilesX, tilesY));
+        if (_disposed || CurrentRoom is not { } room)
+            return;
+
+        HistoryHandler?.ApplyNewAction(new RoomMoveAction(room, tilesX, tilesY));
     }
 
-    public void Undo() => HistoryHandler.Undo();
-    public void Redo() => HistoryHandler.Redo();
+    public void Undo() {
+        if (!_disposed)
+            HistoryHandler?.Undo();
+    }
 
+    public void Redo() {
+        if (!_disposed)
+            HistoryHandler?.Redo();
+    }
 
     public void QuickReload() {
-        if (Map is not { } map) {
+        if (_disposed || Map is not { } map) {
             return;
         }
 
@@ -308,12 +363,15 @@ public sealed class EditorScene : Scene {
         Map = Map.FromBinaryPackage(map.IntoBinary());
 
         if (selectedRoomName is { }) {
-            CurrentRoom = Map.TryGetRoomByName(selectedRoomName)!;
-            CenterCameraOnRoom(CurrentRoom!);
+            CurrentRoom = Map?.TryGetRoomByName(selectedRoomName);
+            if (CurrentRoom != null)
+                CenterCameraOnRoom(CurrentRoom);
         }
     }
 
     public override void Update() {
+        if (_disposed) return;
+
         base.Update();
 
         if (RysyState.ImGuiAvailable) {
@@ -327,36 +385,44 @@ public sealed class EditorScene : Scene {
         AddWindowIfNeeded<EditorGroupWindow>();
 
         if (Map is { }) {
-            Camera.HandleMouseMovement(Input.Global);
+            Camera?.HandleMouseMovement(Input.Global);
 
             HandleRoomSwapInputs(Input.Global);
 
-            ToolHandler.Update(Camera, CurrentRoom);
+            ToolHandler?.Update(Camera, CurrentRoom);
         }
     }
 
     private void HandleRoomSwapInputs(Input input) {
-        if (Map is { } && ToolHandler.CurrentTool.AllowSwappingRooms && input.Mouse.Left.Clicked()) {
-            var mousePos = input.Mouse.Pos.ToVector2();
-            foreach (var room in Map.Rooms) {
-                if (room == CurrentRoom)
-                    continue;
+        if (_disposed || Map is not { } || ToolHandler?.CurrentTool?.AllowSwappingRooms != true || !input.Mouse.Left.Clicked()) {
+            return;
+        }
 
-                var pos = room.WorldToRoomPos(Camera, mousePos);
-                if (room.IsInBounds(pos)) {
-                    CurrentRoom = room;
+        var mousePos = input.Mouse.Pos.ToVector2();
+        foreach (var room in Map.Rooms) {
+            if (room == CurrentRoom)
+                continue;
 
-                    input.Mouse.ConsumeLeft();
-                    break;
-                }
+            var pos = room.WorldToRoomPos(Camera, mousePos);
+            if (room.IsInBounds(pos)) {
+                CurrentRoom = room;
+                
+                // Sync room change to game and play room music
+                Rysy.Audio.EditorAudioManager.PlayRoomMusic(CurrentRoom);
+                Rysy.Synchronization.GameEditorSync.SendCameraPosition(Camera.Pos);
+
+                input.Mouse.ConsumeLeft();
+                break;
             }
         }
     }
 
     public override void Render() {
+        if (_disposed) return;
+
         base.Render();
 
-        var windowSize = RysyState.Window.ClientBounds.Size();
+        var windowSize = RysyState.Window?.ClientBounds.Size() ?? new Microsoft.Xna.Framework.Point(800, 600);
         if (Map is not { }) {
             var height = 4 * 6;
             var center = windowSize.Y / 2;
@@ -370,7 +436,9 @@ public sealed class EditorScene : Scene {
         }
         
         using var buffer = RenderTargetPool.Get(windowSize.X, windowSize.Y);
-        var gd = GFX.Batch.GraphicsDevice;
+        var gd = GFX.Batch?.GraphicsDevice;
+        if (gd == null) return;
+
         gd.SetRenderTarget(buffer.Target);
         gd.Clear(Color.Black);
         
@@ -398,8 +466,8 @@ public sealed class EditorScene : Scene {
         }
         
         gd.SetRenderTarget(null);
-        GFX.BeginBatch(new SpriteBatchState(Effect: EditorState.CurrentColograde.Set()));
-        GFX.Batch.Draw(buffer.Target, Vector2.Zero, Color.White);
+        GFX.BeginBatch(new SpriteBatchState(Effect: EditorState.CurrentColograde?.Set()));
+        GFX.Batch?.Draw(buffer.Target, Vector2.Zero, Color.White);
         GFX.EndBatch();
         
         GFX.BeginBatch(Camera);
@@ -413,16 +481,16 @@ public sealed class EditorScene : Scene {
         }
         GFX.EndBatch();
         
-        ToolHandler.Render(Camera, CurrentRoom);
+        ToolHandler?.Render(Camera, CurrentRoom);
 
         var input = Input.Global;
 
-        if (input.Keyboard.Ctrl()) {
+        if (input?.Keyboard?.Ctrl() == true) {
             // Reload everything
             if (input.Keyboard.IsKeyClicked(Keys.F5)) {
                 RysyEngine.QueueReload();
             }
-        } else {
+        } else if (input?.Keyboard != null) {
             // clear render cache
             if (input.Keyboard.IsKeyClicked(Keys.F4)) {
                 foreach (var room in Map.Rooms)
@@ -431,7 +499,7 @@ public sealed class EditorScene : Scene {
 
             // Reload textures
             if (input.Keyboard.IsKeyClicked(Keys.F5)) {
-                GFX.Atlas.DisposeTextures();
+                GFX.Atlas?.DisposeTextures();
                 foreach (var room in Map.Rooms)
                     room.ClearRenderCache();
                 GC.Collect(3);
@@ -447,6 +515,8 @@ public sealed class EditorScene : Scene {
     }
 
     public override void RenderImGui() {
+        if (_disposed) return;
+
         base.RenderImGui();
 
         Menubar.Render(this);
@@ -455,23 +525,53 @@ public sealed class EditorScene : Scene {
     }
 
     public void CenterCameraOnRoom(Room room) {
-        Camera.CenterOnRealPos(room.Bounds.Center.ToVector2());
+        if (_disposed || room == null) return;
+
+        Camera?.CenterOnRealPos(room.Bounds.Center.ToVector2());
+        
+        // Sync camera position to game
+        Rysy.Synchronization.GameEditorSync.SendCameraPosition(Camera?.Pos ?? Vector2.Zero);
+        
+        // Play room music if enabled
+        Rysy.Audio.EditorAudioManager.PlayRoomMusic(room);
     }
 
     public override void OnEnd() {
         base.OnEnd();
 
-        ToolHandler?.Unload();
-        //ToolHandler = null!;
+        // Unsubscribe from events to prevent memory leaks
         EditorState.OnMapChanged -= OnMapChanged;
+        
+        Dispose();
     }
 
     public override void OnBegin() {
+        if (_disposed) return;
+
         ToolHandler = new ToolHandler(HistoryHandler, Input.Global).UsePersistence(true);
         EditorState.OnMapChanged += OnMapChanged;
 
         OnMapChanged();
 
         base.OnBegin();
+    }
+
+    public void Dispose() {
+        lock (_disposalLock) {
+            if (_disposed) return;
+            _disposed = true;
+
+            // Cancel any ongoing loading operations
+            _loadingCancellationTokenSource?.Cancel();
+            _loadingCancellationTokenSource?.Dispose();
+            _loadingCancellationTokenSource = null;
+
+            // Unload tool handler
+            ToolHandler?.Unload();
+            ToolHandler = null;
+
+            // Unsubscribe from events
+            EditorState.OnMapChanged -= OnMapChanged;
+        }
     }
 }
